@@ -1,7 +1,8 @@
 {
   "name": "om-relay",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "description": "A personal OM delivery service (relay) on your own Cloudflare account: a signed, verified release of the OM reference Home (Worker + SQLite Durable Objects). Nothing else is deployed.",
   "engines": {
     "node": ">=24"

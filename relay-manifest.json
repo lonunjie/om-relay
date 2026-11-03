@@ -1,6 +1,6 @@
 {
   "format": "om.relay-release/1",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "worker": "relay/worker.js",
   "files": [
     {
@@ -30,8 +30,8 @@
     },
     {
       "path": "verify.mjs",
-      "sha256": "dfb66bfcdecfe1407d9a5ed4fdb5c048d0f5d9fa4e1ce76a4d87cb903da8d3bb",
-      "bytes": 16017
+      "sha256": "653c9e3e31983acc0f4317879a67d3111ab4d425496e034afe14311fcbf1324a",
+      "bytes": 16027
     }
   ],
   "config": {
@@ -82,6 +82,7 @@
       ]
     },
     "package": {
+      "license": "AGPL-3.0-or-later",
       "engines": {
         "node": ">=24"
       },
@@ -96,7 +97,7 @@
     }
   },
   "createdFrom": {
-    "gitCommit": "a5c1c38a9526382db4296d3a221fa291e8a545af"
+    "gitCommit": "8fb3fa429be88e937474096fdcf5729d14c366c6"
   },
   "delegation": {
     "format": "om.release-delegation/1",
@@ -141,6 +142,6 @@
   "signature": {
     "alg": "ed25519",
     "keyId": "om-release-2026-10-28",
-    "sig": "w3v5qJyjKMZr4kuoSMO1qQ1zZjyeq7epqT1mZxlA7dCHOvEcViEtMlvqOLzta+pKgttvmekn9qdOA3G0DFSUAA=="
+    "sig": "T85y+QtafmwPz1yIfhW1V+e99yaY7HBTRVccpTYqMfRI8rykWh6jcsu2HnkEPajBhpOZIaRRcYS4zNT4v6WeDQ=="
   }
 }
