@@ -1,6 +1,6 @@
 {
   "format": "om.relay-release/1",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "worker": "relay/worker.js",
   "files": [
     {
@@ -20,8 +20,8 @@
     },
     {
       "path": "relay/worker.js",
-      "sha256": "8481748a2ef898627d1950c5be949f33ba7d758e37c0fb2436dfeca01325d8e6",
-      "bytes": 76380
+      "sha256": "928feb73d3f2bef24555e4aee83ad8b1be310fbc4f890fed7087cd448a3411f3",
+      "bytes": 92174
     },
     {
       "path": "verify-chain.mjs",
@@ -30,8 +30,8 @@
     },
     {
       "path": "verify.mjs",
-      "sha256": "653c9e3e31983acc0f4317879a67d3111ab4d425496e034afe14311fcbf1324a",
-      "bytes": 16027
+      "sha256": "e57645e70384405528d4df4cf5de51d0580525c015bad439856205cfa635e7b1",
+      "bytes": 16039
     }
   ],
   "config": {
@@ -66,6 +66,10 @@
           {
             "name": "INTRO",
             "class_name": "IntroGate"
+          },
+          {
+            "name": "BLOBS",
+            "class_name": "BlobSpool"
           }
         ]
       },
@@ -77,6 +81,12 @@
             "KeyPool",
             "DescriptorStore",
             "IntroGate"
+          ]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": [
+            "BlobSpool"
           ]
         }
       ]
@@ -97,7 +107,7 @@
     }
   },
   "createdFrom": {
-    "gitCommit": "8fb3fa429be88e937474096fdcf5729d14c366c6"
+    "gitCommit": "8466e6ef6cbe09d951e749f14b0b864508889593"
   },
   "delegation": {
     "format": "om.release-delegation/1",
@@ -142,6 +152,6 @@
   "signature": {
     "alg": "ed25519",
     "keyId": "om-release-2026-10-28",
-    "sig": "T85y+QtafmwPz1yIfhW1V+e99yaY7HBTRVccpTYqMfRI8rykWh6jcsu2HnkEPajBhpOZIaRRcYS4zNT4v6WeDQ=="
+    "sig": "IGj534cbuBfmTbyysZHAmilmultvv0rZeQcBNV+qBDSEY2dD8QA+uJKg+LwfGxWnr//ZPjEETXSVGKkeN6faDw=="
   }
 }
