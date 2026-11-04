@@ -218,6 +218,13 @@ function concat(...parts) {
   return out;
 }
 __name(concat, "concat");
+function equalBytes(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return d === 0;
+}
+__name(equalBytes, "equalBytes");
 async function sha256(...parts) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", concat(...parts)));
 }
@@ -469,6 +476,14 @@ function decodeQueueCreate(b) {
   return { requestId, receiveCap, depositCap, ...adminCap === void 0 ? {} : { adminCap } };
 }
 __name(decodeQueueCreate, "decodeQueueCreate");
+function decodeKeyFetchGrant(b) {
+  const o = open(b);
+  const requestId = o.bytes(1, ID, ID);
+  const caps = o.byteList(2, 1, 8, CAP_MIN, CAP_MAX);
+  o.done();
+  return { requestId, caps };
+}
+__name(decodeKeyFetchGrant, "decodeKeyFetchGrant");
 function decodeKeyFetch(b) {
   const o = open(b);
   const requestId = o.bytes(1, ID, ID);
@@ -522,8 +537,9 @@ function decodeTicketParams(b) {
   const payloadLimitBytes = o.uint(2);
   const allowAttachments = o.optBool(3);
   const allowCalls = o.optBool(4);
+  const ticketId = o.optBytes(5, 16, 16);
   o.done();
-  return { ttlSeconds, maxUses, payloadLimitBytes, ...allowAttachments === void 0 ? {} : { allowAttachments }, ...allowCalls === void 0 ? {} : { allowCalls } };
+  return { ttlSeconds, maxUses, payloadLimitBytes, ...allowAttachments === void 0 ? {} : { allowAttachments }, ...allowCalls === void 0 ? {} : { allowCalls }, ...ticketId === void 0 ? {} : { ticketId } };
 }
 __name(decodeTicketParams, "decodeTicketParams");
 var encodeIntroductionTicket = /* @__PURE__ */ __name((t) => encode(map([[0, 15], [1, 1], [2, t.ticketId], [3, t.serviceBinding], [4, t.expiresAt], [5, t.maxUses], [6, t.payloadLimitBytes], [7, t.allowAttachments], [8, t.allowCalls], [9, t.nonce]])), "encodeIntroductionTicket");
@@ -618,6 +634,49 @@ function readBundleFacts(bundle) {
 }
 __name(readBundleFacts, "readBundleFacts");
 
+// ../../packages/om-home-wire/src/blob.ts
+var BLOB_CIPHERTEXT_LABEL = "OM-BLOB-CIPHERTEXT-HASH-v1";
+var BLOB_DIGEST_HEADER = "om-ciphertext-digest";
+var ID2 = 16;
+var CAP_MIN2 = 32;
+var CAP_MAX2 = 96;
+var BLOB_WIRE_MAX = 16 * 1024 * 1024;
+function bstrHead(n) {
+  if (n < 24) return Uint8Array.of(64 | n);
+  if (n < 256) return Uint8Array.of(88, n);
+  if (n < 65536) return Uint8Array.of(89, n >> 8, n & 255);
+  if (n < 4294967296) return Uint8Array.of(90, n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255);
+  throw new CborError("blob too large");
+}
+__name(bstrHead, "bstrHead");
+async function blobCiphertextDigest(ciphertext) {
+  return sha256(Uint8Array.of(130), encode(BLOB_CIPHERTEXT_LABEL), bstrHead(ciphertext.length), ciphertext);
+}
+__name(blobCiphertextDigest, "blobCiphertextDigest");
+function parseBlobDigestHeader(value) {
+  if (value === null) return void 0;
+  try {
+    const d = fromBase64Url(value.trim());
+    return d.length === 32 ? d : void 0;
+  } catch {
+    return void 0;
+  }
+}
+__name(parseBlobDigestHeader, "parseBlobDigestHeader");
+var blobLocatorPattern = /^[0-9a-f]{32}$/;
+function decodeBlobPutRequest(b) {
+  const o = new Obj(decode(b));
+  if (o.uint(0) !== API_MAJOR) throw new CborError("unsupported api major");
+  const requestId = o.bytes(1, ID2, ID2);
+  const cap = o.bytes(2, CAP_MIN2, CAP_MAX2);
+  const ciphertext = o.bytes(3, 1, BLOB_WIRE_MAX);
+  const retentionSeconds = o.optUint(4);
+  o.done();
+  return { requestId, cap, ciphertext, ...retentionSeconds === void 0 ? {} : { retentionSeconds } };
+}
+__name(decodeBlobPutRequest, "decodeBlobPutRequest");
+var encodeBlobPutResponse = /* @__PURE__ */ __name((r) => encode(map([[0, API_MAJOR], [1, r.readCap], [2, r.digest], [3, r.expiresAt]])), "encodeBlobPutResponse");
+
 // ../../packages/om-home-wire/src/index.ts
 var FEATURES = {
   relayQueues: "om.relay.queues.v1",
@@ -626,9 +685,13 @@ var FEATURES = {
   admission: "om.admission.v1",
   keysPool: "om.keys.pool.v1",
   keysAnonymousFetch: "om.keys.fetch-throttled.v1",
+  /** Fetching a device's bundle needs a capability its owner granted for one relationship (D4). */
+  keysRelationshipCaps: "om.keys.relationship-caps.v1",
   discoveryPut: "om.discovery.put.v1",
   discoveryDelete: "om.discovery.delete.v1",
-  introGate: "om.intro.v1"
+  introGate: "om.intro.v1",
+  /** A bounded encrypted blob spool (put, get, delete by capability); offered only where the Home has owner admission (docs/reports/2026-11-04-attachments-home-status.md). */
+  blobSpool: "om.blob.spool.v1"
 };
 
 // src/limits.ts
@@ -658,9 +721,20 @@ var LIMITS = {
   idempotencySeconds: 7 * DAY,
   rotateOverlapSeconds: DAY,
   rotateResultSeconds: 600,
+  /**
+   * Blob spool (feature om.blob.spool.v1), deliberately small: a free-plan Home keeps no card and no R2, so the spool is a
+   * temporary hand-over area for small attachments, not storage. 32 MiB holds a few photos for a week; one object is at most
+   * 4 MiB so a put stays well inside a Worker's 128 MB and a Durable Object's request budget. Larger files travel directly
+   * between the two devices or through a BlobStore the person enables (STORAGE_AND_BLOB_ARCHITECTURE). Operational values, never protocol constants.
+   */
+  maxBlobSpoolBytes: 32 * 1024 * 1024,
+  maxBlobBytes: 4 * 1024 * 1024,
+  maxBlobs: 64,
   /** Key pool. */
   maxOneTimePerKind: 100,
   maxBundleBytes: 65536,
+  /** Relationship fetch capabilities one device pool holds (one per accepted relationship). */
+  maxFetchCapabilities: 256,
   fetchBurst: 8,
   fetchRefillSeconds: 600,
   /** Descriptor store. */
@@ -680,15 +754,16 @@ var LIMITS = {
 
 // src/capabilities.ts
 var wakeOn = /* @__PURE__ */ __name((env) => env.OM_WAKE !== "0", "wakeOn");
+var blobsOn = /* @__PURE__ */ __name((env) => env.BLOBS !== void 0 && env.OM_BLOB_SPOOL !== "0" && admissionHashes(env).length > 0, "blobsOn");
 var admissionHashes = /* @__PURE__ */ __name((env) => (env.OM_ADMISSION ?? "").split(",").map((h) => h.trim().toLowerCase()).filter((h) => /^[0-9a-f]{64}$/.test(h)), "admissionHashes");
 var admissionConfigured = /* @__PURE__ */ __name((env) => (env.OM_ADMISSION ?? "").trim() !== "" || env.OM_ADMISSION_REQUIRED === "1", "admissionConfigured");
 function capabilitiesDocument(env) {
   return {
     schema_version: 1,
     provider_id: env.OM_PROVIDER_ID ?? "om-reference-home",
-    provider_kinds: ["relay", "key_material", "discovery_relay", "intro_gate"],
+    provider_kinds: ["relay", "key_material", "discovery_relay", "intro_gate", ...blobsOn(env) ? ["blob"] : []],
     durability_class: "durable",
-    features: Object.values(FEATURES).filter((f) => (f !== FEATURES.relayWake || wakeOn(env)) && (f !== FEATURES.admission || admissionHashes(env).length > 0)).sort(),
+    features: Object.values(FEATURES).filter((f) => (f !== FEATURES.relayWake || wakeOn(env)) && (f !== FEATURES.admission || admissionHashes(env).length > 0) && (f !== FEATURES.blobSpool || blobsOn(env))).sort(),
     api_versions: ["1"],
     health: "healthy",
     limits: {
@@ -702,12 +777,14 @@ function capabilitiesDocument(env) {
       max_deposit_capabilities: LIMITS.maxDepositCapabilities,
       max_descriptor_bytes: LIMITS.maxDescriptorBytes,
       max_ticket_uses: LIMITS.maxTicketUses,
+      ...blobsOn(env) ? { max_blob_spool_bytes: LIMITS.maxBlobSpoolBytes, max_blob_bytes: LIMITS.maxBlobBytes, max_blobs: LIMITS.maxBlobs, blob_default_retention_seconds: LIMITS.defaultRetentionSeconds } : {},
       ...wakeOn(env) ? { wake_sockets_per_queue: LIMITS.maxWakeSockets, wake_auth_seconds: WAKE_AUTH_SECONDS } : {}
     },
     abuse_controls: {
       per_capability_deposit_rate: { burst: LIMITS.depositBurst, per_second: LIMITS.depositRefillPerSecond },
       one_time_prekey_fetch_throttle: { burst: LIMITS.fetchBurst, refill_seconds: LIMITS.fetchRefillSeconds },
       introgate_submit_rate: { burst: LIMITS.submitBurst, per_second: LIMITS.submitRefillPerSecond },
+      ...blobsOn(env) ? { blob_put: "needs owner admission; the ciphertext digest is verified; bytes and count are bounded; the read capability is minted by the Home" } : {},
       object_shape_check: "deposits must be a SealedDeliveryEnvelope or a MessageRequest",
       replay: "exact-retry idempotent; a different object under the same (delivery_key_id, delivery_id) is rejected"
     },
@@ -782,7 +859,7 @@ var BASE_HEADERS = {
 };
 var preflight = /* @__PURE__ */ __name(() => new Response(null, {
   status: 204,
-  headers: { ...BASE_HEADERS, "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers": "authorization, content-type, om-admission", "Access-Control-Max-Age": "86400" }
+  headers: { ...BASE_HEADERS, "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers": "authorization, content-type, om-admission, om-ciphertext-digest", "Access-Control-Max-Age": "86400" }
 }), "preflight");
 function ok(body2, contentType = CBOR) {
   return new Response(body2.length === 0 ? null : body2, { status: body2.length === 0 ? 204 : 200, headers: { ...BASE_HEADERS, "Content-Type": contentType } });
@@ -844,7 +921,7 @@ function bearer(request) {
 }
 __name(bearer, "bearer");
 
-// src/descriptors.ts
+// src/blobs.ts
 import { DurableObject } from "cloudflare:workers";
 
 // src/sql.ts
@@ -879,12 +956,161 @@ function metaString(sql, key) {
 }
 __name(metaString, "metaString");
 
-// src/descriptors.ts
+// src/blobs.ts
+var CHUNK = 1024 * 1024;
 var SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v);
+CREATE TABLE IF NOT EXISTS blobs (id BLOB PRIMARY KEY, owner_hash TEXT NOT NULL, read_hash TEXT NOT NULL, len INTEGER NOT NULL, chunks INTEGER NOT NULL, digest BLOB NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS chunks (id BLOB NOT NULL, idx INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY (id, idx));
+CREATE TABLE IF NOT EXISTS ops (request_id TEXT PRIMARY KEY, fp TEXT NOT NULL, expires_at INTEGER NOT NULL);
+`;
+var BlobSpool = class extends DurableObject {
+  static {
+    __name(this, "BlobSpool");
+  }
+  sql;
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec(SCHEMA);
+  }
+  get hard() {
+    return this.env.OM_HARD_FREE_TIER === "1";
+  }
+  /** The per-spool secret the read capabilities derive from; created on first use and never leaves this object. */
+  readSecret() {
+    const row = one(this.sql, "SELECT v FROM meta WHERE k = 'spool_key'");
+    if (row?.v) return new Uint8Array(row.v);
+    const key = randomBytes(32);
+    run(this.sql, "INSERT INTO meta (k, v) VALUES ('spool_key', ?)", key);
+    return key;
+  }
+  async readCapFor(id, ownerHash) {
+    const k = await crypto.subtle.importKey("raw", this.readSecret(), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", k, concat(utf82("OM-BLOB-READ-CAP-v1"), id, utf82(ownerHash))));
+    return concat(id, mac);
+  }
+  usage() {
+    const r = one(this.sql, "SELECT COUNT(*) AS n, SUM(len) AS b FROM blobs");
+    return { count: r?.n ?? 0, bytes: r?.b ?? 0 };
+  }
+  purge(now) {
+    run(this.sql, "DELETE FROM chunks WHERE id IN (SELECT id FROM blobs WHERE expires_at + ? < ?)", LIMITS.skewSeconds, now);
+    run(this.sql, "DELETE FROM blobs WHERE expires_at + ? < ?", LIMITS.skewSeconds, now);
+    run(this.sql, "DELETE FROM ops WHERE expires_at < ?", now);
+  }
+  async schedule() {
+    const t = one(this.sql, "SELECT MIN(expires_at) + ? AS t FROM blobs", LIMITS.skewSeconds)?.t;
+    if (t === null || t === void 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(Math.max(Date.now() + 1e3, t * 1e3 + 1e3));
+  }
+  async alarm() {
+    this.purge(nowSeconds());
+    await this.schedule();
+  }
+  drop(id) {
+    run(this.sql, "DELETE FROM chunks WHERE id = ?", id);
+    run(this.sql, "DELETE FROM blobs WHERE id = ?", id);
+  }
+  async putResponse(row) {
+    return encodeBlobPutResponse({ readCap: await this.readCapFor(new Uint8Array(row.id), row.owner_hash), digest: new Uint8Array(row.digest), expiresAt: row.expires_at });
+  }
+  /**
+   * Stores one ciphertext. `expected` is the digest the sender computed over it (OM-BLOB-CIPHERTEXT-HASH-v1); the Home
+   * recomputes and refuses a mismatch, so a truncated or altered upload is never stored. The same owner capability with the
+   * same bytes is an exact retry and returns the original answer; anything else under an existing locator is `invalid_request`.
+   */
+  put(req, expected) {
+    return reply(async () => {
+      const len = req.ciphertext.length;
+      if (len > LIMITS.maxBlobBytes) throw new HomeError("payload_too_large");
+      let ttl = LIMITS.defaultRetentionSeconds;
+      if (req.retentionSeconds !== void 0) {
+        if (req.retentionSeconds < 1 || req.retentionSeconds > LIMITS.maxRetentionSeconds) throw new HomeError("invalid_request", { hint: "retention outside this Home's bound" });
+        ttl = req.retentionSeconds;
+      }
+      const id = req.cap.slice(0, 16);
+      const ownerHash = await capHash(req.cap);
+      const fp = await fingerprint(req.cap, expected);
+      const rid = await fingerprint(req.requestId);
+      const seen = one(this.sql, "SELECT fp FROM ops WHERE request_id = ?", rid);
+      if (seen && seen.fp !== fp) throw new HomeError("invalid_request", { hint: "request_id reused with different operation" });
+      const now = nowSeconds();
+      this.purge(now);
+      const existing = one(this.sql, "SELECT * FROM blobs WHERE id = ?", id);
+      if (existing) {
+        if (existing.owner_hash === ownerHash && equalBytes(new Uint8Array(existing.digest), expected)) return this.putResponse(existing);
+        throw new HomeError("invalid_request", { hint: "locator in use" });
+      }
+      const got = await blobCiphertextDigest(req.ciphertext);
+      if (!equalBytes(got, expected)) throw new HomeError("invalid_request", { hint: "ciphertext digest mismatch" });
+      const u = this.usage();
+      if (u.count >= LIMITS.maxBlobs || u.bytes + len > LIMITS.maxBlobSpoolBytes) throw new HomeError("quota", { detail: quotaDetail(4, this.hard) });
+      const readCap = await this.readCapFor(id, ownerHash);
+      const row = { id, owner_hash: ownerHash, read_hash: await capHash(readCap), len, chunks: Math.ceil(len / CHUNK), digest: got, expires_at: now + ttl };
+      this.ctx.storage.transactionSync(() => {
+        run(this.sql, "INSERT INTO blobs (id, owner_hash, read_hash, len, chunks, digest, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)", row.id, row.owner_hash, row.read_hash, row.len, row.chunks, row.digest, row.expires_at);
+        for (let i = 0; i < row.chunks; i++) run(this.sql, "INSERT INTO chunks (id, idx, bytes) VALUES (?, ?, ?)", id, i, req.ciphertext.slice(i * CHUNK, (i + 1) * CHUNK));
+        run(this.sql, "INSERT OR REPLACE INTO ops (request_id, fp, expires_at) VALUES (?, ?, ?)", rid, fp, now + LIMITS.idempotencySeconds);
+        run(this.sql, "DELETE FROM ops WHERE rowid <= (SELECT MAX(rowid) FROM ops) - ?", LIMITS.maxReplayRows);
+      });
+      await this.schedule();
+      return encodeBlobPutResponse({ readCap, digest: got, expiresAt: row.expires_at });
+    });
+  }
+  /** The row a presented capability opens, and which kind it is. A wrong capability and an absent locator answer alike (`not_found`): no existence oracle. */
+  async open(locator, cap) {
+    this.purge(nowSeconds());
+    const row = one(this.sql, "SELECT * FROM blobs WHERE id = ?", locator);
+    const h = await capHash(cap);
+    if (!row || !equalBytes(cap.slice(0, 16), locator)) throw new HomeError("not_found");
+    const owner = row.owner_hash === h;
+    if (!owner && row.read_hash !== h) throw new HomeError("not_found");
+    return { row, owner };
+  }
+  /** The ciphertext, re-hashed against the digest stored at put: a blob that no longer matches is deleted and reported absent. */
+  get(locator, cap) {
+    return reply(async () => {
+      const { row } = await this.open(locator, cap);
+      if (nowSeconds() > row.expires_at) throw new HomeError("expired");
+      const parts = all(this.sql, "SELECT bytes FROM chunks WHERE id = ? ORDER BY idx", locator).map((c) => new Uint8Array(c.bytes));
+      const bytes = concat(...parts);
+      if (bytes.length !== row.len || !equalBytes(await blobCiphertextDigest(bytes), new Uint8Array(row.digest))) {
+        this.drop(locator);
+        await this.schedule();
+        throw new HomeError("not_found");
+      }
+      return bytes;
+    });
+  }
+  /** Owner only. Deleting a blob that is already gone is success-equivalent (home-api: idempotent). */
+  remove(locator, cap) {
+    return reply(async () => {
+      let opened;
+      try {
+        opened = await this.open(locator, cap);
+      } catch (e) {
+        if (e instanceof HomeError && e.errorName === "not_found") return new Uint8Array(0);
+        throw e;
+      }
+      if (!opened.owner) throw new HomeError("unauthorized");
+      this.drop(locator);
+      await this.schedule();
+      return new Uint8Array(0);
+    });
+  }
+};
+
+// src/descriptors.ts
+import { DurableObject as DurableObject2 } from "cloudflare:workers";
+var SCHEMA2 = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v);
 CREATE TABLE IF NOT EXISTS ops (request_id TEXT PRIMARY KEY, fp TEXT NOT NULL, expires_at INTEGER NOT NULL);
 `;
-var DescriptorStore = class extends DurableObject {
+var DescriptorStore = class extends DurableObject2 {
   static {
     __name(this, "DescriptorStore");
   }
@@ -892,7 +1118,7 @@ var DescriptorStore = class extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(SCHEMA);
+    this.sql.exec(SCHEMA2);
   }
   async schedule() {
     const until = metaNumber(this.sql, "keep_until", 0);
@@ -964,7 +1190,7 @@ var DescriptorStore = class extends DurableObject {
 };
 
 // src/intro.ts
-import { DurableObject as DurableObject2 } from "cloudflare:workers";
+import { DurableObject as DurableObject3 } from "cloudflare:workers";
 
 // src/mailbox.ts
 var MAILBOX_SCHEMA = `
@@ -1049,11 +1275,11 @@ var cursorOf = /* @__PURE__ */ __name((seq) => {
 }, "cursorOf");
 
 // src/intro.ts
-var SCHEMA2 = `${MAILBOX_SCHEMA}
+var SCHEMA3 = `${MAILBOX_SCHEMA}
 CREATE TABLE IF NOT EXISTS tickets (id BLOB PRIMARY KEY, expires_at INTEGER NOT NULL, max_uses INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, payload_limit INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS uses (ticket_id BLOB NOT NULL, fp TEXT NOT NULL, PRIMARY KEY (ticket_id, fp));
 `;
-var IntroGate = class extends DurableObject2 {
+var IntroGate = class extends DurableObject3 {
   static {
     __name(this, "IntroGate");
   }
@@ -1061,7 +1287,7 @@ var IntroGate = class extends DurableObject2 {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(SCHEMA2);
+    this.sql.exec(SCHEMA3);
   }
   get hard() {
     return this.env.OM_HARD_FREE_TIER === "1";
@@ -1111,10 +1337,12 @@ var IntroGate = class extends DurableObject2 {
       const active = one(this.sql, "SELECT COUNT(*) AS n FROM tickets WHERE revoked = 0 AND expires_at + ? >= ?", LIMITS.skewSeconds, now)?.n ?? 0;
       const out = [];
       const binding = (await sha256(prefix)).slice(0, 16);
+      if (params.ticketId && (count !== 1 || !params.ticketId.subarray(0, 8).every((b, i) => b === prefix[i]))) throw new HomeError("invalid_request");
       for (let i = 0; i < count; i++) {
         const idTail = (await sha256(prefix, req.requestId, new Uint8Array([i]))).slice(0, 8);
-        const id = concat(prefix, idTail);
+        const id = params.ticketId ?? concat(prefix, idTail);
         const row = one(this.sql, "SELECT expires_at, max_uses, payload_limit FROM tickets WHERE id = ?", id);
+        if (row && params.ticketId && (row.max_uses !== params.maxUses || row.payload_limit !== params.payloadLimitBytes)) throw new HomeError("invalid_request");
         if (!row) {
           if (active + out.length >= LIMITS.maxTicketsPerService) throw new HomeError("quota", { detail: quotaDetail(4, this.hard) });
           run(this.sql, "INSERT INTO tickets (id, expires_at, max_uses, payload_limit) VALUES (?, ?, ?, ?)", id, now + params.ttlSeconds, params.maxUses, params.payloadLimitBytes);
@@ -1196,13 +1424,14 @@ var IntroGate = class extends DurableObject2 {
 };
 
 // src/keys.ts
-import { DurableObject as DurableObject3 } from "cloudflare:workers";
-var SCHEMA3 = `
+import { DurableObject as DurableObject4 } from "cloudflare:workers";
+var SCHEMA4 = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v);
 CREATE TABLE IF NOT EXISTS prekeys (id INTEGER PRIMARY KEY AUTOINCREMENT, kind INTEGER NOT NULL, item BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS ops (request_id TEXT PRIMARY KEY, fp TEXT NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS fetch_caps (h TEXT PRIMARY KEY, tokens REAL NOT NULL, tokens_at INTEGER NOT NULL);
 `;
-var KeyPool = class extends DurableObject3 {
+var KeyPool = class extends DurableObject4 {
   static {
     __name(this, "KeyPool");
   }
@@ -1210,7 +1439,7 @@ var KeyPool = class extends DurableObject3 {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(SCHEMA3);
+    this.sql.exec(SCHEMA4);
   }
   get hard() {
     return this.env.OM_HARD_FREE_TIER === "1";
@@ -1257,28 +1486,54 @@ var KeyPool = class extends DurableObject3 {
     });
   }
   /**
-   * Returns `[bundle, one-time item?, pq one-time item?]`. Consumption is throttled per device, so a stranger cannot
-   * drain the pool faster than it refills; a throttled fetch gets the signed bundle without one-time items, which is
-   * the specified degraded (not weaker) handshake.
+   * `PUT /v1/keys/bundles/{device}/fetch-caps` (feature om.keys.relationship-caps.v1): the owner (holder of the device's
+   * key_publish_cap) grants fetch capabilities, one per accepted relationship. Only hashes are kept. A retry grants the
+   * same capability again, which changes nothing.
    */
-  fetchItems() {
-    return reply(() => {
+  grantFetch(cap, caps) {
+    return reply(async () => {
+      await this.publishAuth(cap, false);
+      const now = nowSeconds();
+      const have = one(this.sql, "SELECT COUNT(*) AS n FROM fetch_caps")?.n ?? 0;
+      for (const c of caps) {
+        const h = await capHash(c);
+        if (one(this.sql, "SELECT 1 AS x FROM fetch_caps WHERE h = ?", h)) continue;
+        if (have + 1 > LIMITS.maxFetchCapabilities) throw new HomeError("quota", { detail: quotaDetail(4, this.hard) });
+        run(this.sql, "INSERT INTO fetch_caps (h, tokens, tokens_at) VALUES (?, ?, ?)", h, LIMITS.fetchBurst, now);
+      }
+      return new Uint8Array(0);
+    });
+  }
+  /**
+   * Returns `[bundle, one-time item?, pq one-time item?]` to the holder of a relationship fetch capability the owner
+   * granted (ASYNC_KEY_MATERIAL 2.1); anyone else gets `unauthorized`. Consumption is throttled per capability and per
+   * device, so one capability cannot drain the pool faster than it refills; a throttled fetch gets the signed bundle
+   * without one-time items, which is the specified degraded (not weaker) handshake.
+   */
+  fetchItems(cap) {
+    return reply(async () => {
+      const h = await capHash(cap);
+      const granted = one(this.sql, "SELECT tokens, tokens_at FROM fetch_caps WHERE h = ?", h);
+      if (!granted) throw new HomeError("unauthorized");
       const bundle = getBundle(this.sql);
       if (!bundle) throw new HomeError("not_found");
       const now = nowSeconds();
       const items = [bundle];
-      const t = takeToken(metaNumber(this.sql, "tokens", LIMITS.fetchBurst), metaNumber(this.sql, "tokens_at", now), now, LIMITS.fetchBurst, 1 / LIMITS.fetchRefillSeconds);
-      if (t.allowed) {
+      const refill = 1 / LIMITS.fetchRefillSeconds;
+      const device = takeToken(metaNumber(this.sql, "tokens", LIMITS.fetchBurst), metaNumber(this.sql, "tokens_at", now), now, LIMITS.fetchBurst, refill);
+      const held = takeToken(granted.tokens, granted.tokens_at, now, LIMITS.fetchBurst, refill);
+      if (device.allowed && held.allowed) {
         for (const kind of [1, 2]) {
           const row = one(this.sql, "SELECT id, item FROM prekeys WHERE kind = ? ORDER BY id LIMIT 1", kind);
           if (!row) continue;
           run(this.sql, "DELETE FROM prekeys WHERE id = ?", row.id);
           items.push(new Uint8Array(row.item));
         }
-        setMeta(this.sql, "tokens", t.tokens);
+        setMeta(this.sql, "tokens", device.tokens);
         setMeta(this.sql, "tokens_at", now);
+        run(this.sql, "UPDATE fetch_caps SET tokens = ?, tokens_at = ? WHERE h = ?", held.tokens, now, h);
       }
-      return Promise.resolve(encodeKeyFetchResponse({ items }));
+      return encodeKeyFetchResponse({ items });
     });
   }
   /** Best-effort cleanup after rotation or compromise: idempotent, and never evidence that an older generation is safe (PC-K06). */
@@ -1304,7 +1559,7 @@ function getBundle(sql) {
 __name(getBundle, "getBundle");
 
 // src/queue.ts
-import { DurableObject as DurableObject4 } from "cloudflare:workers";
+import { DurableObject as DurableObject5 } from "cloudflare:workers";
 
 // src/rules.ts
 function depositCapStatus(cap, queue, now) {
@@ -1328,11 +1583,11 @@ function sealedExpiry(expiresAt, now) {
 __name(sealedExpiry, "sealedExpiry");
 
 // src/queue.ts
-var SCHEMA4 = `${MAILBOX_SCHEMA}
+var SCHEMA5 = `${MAILBOX_SCHEMA}
 CREATE TABLE IF NOT EXISTS dcaps (hash TEXT PRIMARY KEY, id BLOB NOT NULL, generation INTEGER NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL DEFAULT 0, max_items INTEGER, tokens REAL NOT NULL, tokens_at INTEGER NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS dcaps_id ON dcaps (id);
 `;
-var MailboxQueue = class extends DurableObject4 {
+var MailboxQueue = class extends DurableObject5 {
   static {
     __name(this, "MailboxQueue");
   }
@@ -1340,7 +1595,7 @@ var MailboxQueue = class extends DurableObject4 {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(SCHEMA4);
+    this.sql.exec(SCHEMA5);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(WAKE_PING, WAKE_PONG));
   }
   get hard() {
@@ -1646,6 +1901,8 @@ var hex = /* @__PURE__ */ __name((b) => Array.from(b, (x) => x.toString(16).padS
 var queueOf = /* @__PURE__ */ __name((env, cap) => env.QUEUES.get(env.QUEUES.idFromName(`q:${hex(cap.slice(0, 16))}`)), "queueOf");
 var introOf = /* @__PURE__ */ __name((env, cap) => env.INTRO.get(env.INTRO.idFromName(`i:${hex(cap.slice(0, 8))}`)), "introOf");
 var BODY_MAX = LIMITS.maxDepositBytes + 2048;
+var BLOB_BODY_MAX = LIMITS.maxBlobBytes + 2048;
+var spoolOf = /* @__PURE__ */ __name((env) => env.BLOBS?.get(env.BLOBS.idFromName("spool")), "spoolOf");
 var wellFormed = /* @__PURE__ */ __name((cap, prefix) => cap.length >= prefix + 16 && cap.length <= 96, "wellFormed");
 var Bad = class extends Error {
   constructor(code) {
@@ -1747,6 +2004,29 @@ async function route(request, env) {
     if (!admin || !wellFormed(admin, 16)) return fail("unauthorized");
     return fromReply(await queueOf(env, admin).revokeDepositCapability(admin, fromHex(revokeMatch[1] ?? "")));
   }
+  if (path === "/v1/blobs" || path.startsWith("/v1/blobs/")) {
+    const spool = blobsOn(env) ? spoolOf(env) : void 0;
+    if (!spool) return fail("not_found");
+    if (path === "/v1/blobs") {
+      if (m !== "POST") return fail("invalid_request");
+      if (!await admitted(request, env)) return fail("unauthorized");
+      const expected = parseBlobDigestHeader(request.headers.get(BLOB_DIGEST_HEADER));
+      if (!expected) return fail("invalid_request");
+      const req = parse(decodeBlobPutRequest, await body(request, BLOB_BODY_MAX));
+      if (!wellFormed(req.cap, 16)) return fail("invalid_request");
+      return fromReply(await spool.put(req, expected));
+    }
+    const locator = path.slice("/v1/blobs/".length);
+    if (!blobLocatorPattern.test(locator)) return fail("not_found");
+    const cap = bearer(request);
+    if (!cap) return fail("unauthorized");
+    if (m === "GET") {
+      const r = await spool.get(fromHex(locator), cap);
+      return r.ok ? ok(r.body, "application/octet-stream") : fromReply(r);
+    }
+    if (m === "DELETE") return fromReply(await spool.remove(fromHex(locator), cap));
+    return fail("invalid_request");
+  }
   const desc = /^\/v1\/discovery\/descriptors\/([0-9a-f]{32})$/.exec(path);
   if (desc) {
     const stub = env.DESCRIPTORS.get(env.DESCRIPTORS.idFromName(`d:${desc[1] ?? ""}`));
@@ -1766,6 +2046,14 @@ async function route(request, env) {
     const device = fromHex(bundle[1] ?? "");
     return fromReply(await env.KEYS.get(env.KEYS.idFromName(`k:${bundle[1] ?? ""}`)).publish(cap, device, parse(decodeKeyPublish, await body(request, 4 * LIMITS.maxBundleBytes))));
   }
+  const grant = /^\/v1\/keys\/bundles\/([0-9a-f]{32})\/fetch-caps$/.exec(path);
+  if (grant) {
+    if (m !== "PUT") return fail("invalid_request");
+    const cap = bearer(request);
+    if (!cap) return fail("unauthorized");
+    const req = parse(decodeKeyFetchGrant, await body(request, 2048));
+    return fromReply(await env.KEYS.get(env.KEYS.idFromName(`k:${grant[1] ?? ""}`)).grantFetch(cap, req.caps));
+  }
   const gen = /^\/v1\/keys\/bundles\/([0-9a-f]{32})\/generations\/(\d{1,15})$/.exec(path);
   if (gen) {
     if (m !== "DELETE") return fail("invalid_request");
@@ -1778,7 +2066,7 @@ async function route(request, env) {
     const items = [];
     for (const d of req.devices) {
       if (d.length !== 16) return fail("invalid_request");
-      const r = await env.KEYS.get(env.KEYS.idFromName(`k:${hex(d)}`)).fetchItems();
+      const r = await env.KEYS.get(env.KEYS.idFromName(`k:${hex(d)}`)).fetchItems(req.cap);
       if (!r.ok) return fromReply(r);
       items.push(...decodeKeyFetchResponse(r.body).items);
     }
@@ -1788,6 +2076,12 @@ async function route(request, env) {
     const cap = bearer(request);
     if (!cap || !wellFormed(cap, 8) || !await admitted(request, env)) return fail("unauthorized");
     return fromReply(await introOf(env, cap).issueTickets(cap, parse(decodeIntroTicketRequest, await body(request, 1024))));
+  }
+  const ticket = /^\/v1\/intro\/tickets\/([0-9a-f]{32})$/.exec(path);
+  if (ticket && m === "DELETE") {
+    const cap = bearer(request);
+    if (!cap || !wellFormed(cap, 8) || !await admitted(request, env)) return fail("unauthorized");
+    return fromReply(await introOf(env, cap).revokeTicket(cap, fromHex(ticket[1] ?? "")));
   }
   if (path === "/v1/intro/requests") {
     const b = await body(request, LIMITS.maxTicketPayload + 4096);
@@ -1826,6 +2120,7 @@ var index_default = {
   }
 };
 export {
+  BlobSpool,
   DescriptorStore,
   IntroGate,
   KeyPool,
